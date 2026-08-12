@@ -13,11 +13,13 @@ from __future__ import annotations
 import asyncio
 from typing import AsyncIterator
 
+from custom_types import InputMode
 from runners.models import (
     GenerationEvent,
     GenerationInput,
     ProbeResult,
     RunnerCapabilities,
+    RunnerStack,
 )
 
 # Fixed probe argv — never user-controlled, never a shell.
@@ -32,8 +34,13 @@ _TIMEOUT_REASON = "codex probe timed out"
 _NONZERO_REASON = "codex binary exited with an error"
 
 # Declared capability shape: exactly the four local stacks and image+text input.
-_SUPPORTED_STACKS = ["html_tailwind", "html_css", "react_tailwind", "vue_tailwind"]
-_SUPPORTED_INPUT_MODES = ["image", "text"]
+_SUPPORTED_STACKS: list[RunnerStack] = [
+    "html_tailwind",
+    "html_css",
+    "react_tailwind",
+    "vue_tailwind",
+]
+_SUPPORTED_INPUT_MODES: list[InputMode] = ["image", "text"]
 
 
 class CodexCliRunner:
