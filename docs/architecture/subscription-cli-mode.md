@@ -123,8 +123,7 @@ The existing API-key generation path remains present and untouched.
 - This repository is a fork of
   [`abi/screenshot-to-code`](https://github.com/abi/screenshot-to-code) (MIT).
 - The last common commit with upstream is `d026163f586dfa8c5c10d28c36edd59a9d3b0e88`.
-  HEAD is 3 commits ahead of that baseline: the initial architecture documentation
-  plus two runner-contracts commits.
+  HEAD is several commits ahead of that baseline.
 - That is a point-in-time divergence marker, not a claim of continuing synchronization.
 
 ## 6. Out of scope for v0.1
