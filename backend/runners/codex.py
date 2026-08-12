@@ -62,6 +62,15 @@ class CodexCliRunner:
         try:
             await asyncio.wait_for(proc.communicate(), timeout=_PROBE_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
+            # Stop and reap the child before returning; never leak a live process.
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
             return ProbeResult(available=False, unavailable_reason=_TIMEOUT_REASON)
 
         if proc.returncode == 0:

@@ -58,9 +58,25 @@ class _HangingProcess:
 
     returncode: Optional[int] = None
 
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.awaited = False
+
     async def communicate(self) -> tuple:
         await asyncio.Event().wait()
         return b"", b""  # pragma: no cover - unreachable by design
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    async def wait(self) -> int:
+        self.awaited = True
+        self.returncode = -15
+        return self.returncode
 
 
 async def test_probe_available_on_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -131,6 +147,28 @@ async def test_probe_timeout_returns_safe_unavailable(
     result = await CodexCliRunner().probe()
     assert result.available is False
     assert result.unavailable_reason is not None
+
+
+async def test_probe_timeout_terminates_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On timeout the child must be stopped and reaped before returning."""
+
+    proc = _HangingProcess()
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> _HangingProcess:
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("runners.codex._PROBE_TIMEOUT_SECONDS", 0.05)
+
+    result = await CodexCliRunner().probe()
+
+    assert result.available is False
+    assert result.unavailable_reason is not None
+    # The timed-out child was terminated/killed and awaited (reaped).
+    assert proc.terminated or proc.killed
+    assert proc.awaited
 
 
 async def test_probe_nonzero_exit_returns_safe_unavailable(
