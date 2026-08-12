@@ -28,6 +28,29 @@ Screenshot to Code also supports taking a screen recording of a website in actio
 
 ![google in app quick 3](https://github.com/abi/screenshot-to-code/assets/23818/8758ffa4-9483-4b9b-bb66-abd6d1594c33)
 
+## 🔀 Fork direction: local subscription-CLI mode (planned)
+
+This fork of [abi/screenshot-to-code](https://github.com/abi/screenshot-to-code) is working
+toward a **local subscription-CLI mode**: generation driven by a locally installed,
+user-authenticated coding CLI (starting with **Codex CLI**) instead of developer API keys. The
+existing React/Vite WebUI and FastAPI backend are kept; generation is planned to run through
+local **runner adapters** that invoke the vendor CLI directly, with a local HTTP job API and an
+MCP server exposing the same backend to agents.
+
+| | Legacy API-key mode (shipped upstream) | Local subscription-CLI mode (planned) |
+|---|---|---|
+| Authentication | Developer API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `REPLICATE_API_KEY`) | Existing vendor CLI sign-in on your host (Codex CLI first) |
+| Generation | In-process provider agents calling vendor HTTP APIs | Local runner adapters invoking the vendor CLI in a sandboxed, ephemeral workspace |
+| Agent access | WebUI only (WebSocket) | WebUI + local HTTP job API + MCP server |
+| Status | **Ships today** | **Planned — not implemented** |
+
+**Status:** everything described for the subscription-CLI mode is *planned, not shipped*. The
+only generation path that exists today is the upstream API-key mode documented below. The
+subscription-CLI mode is not an OpenAI-compatible proxy, does not read or copy vendor OAuth
+credentials, and is intended for a user-controlled host bound to loopback by default. See
+[docs/architecture/subscription-cli-mode.md](docs/architecture/subscription-cli-mode.md) for the
+full architecture, hard boundaries, and the current-vs-planned breakdown.
+
 ## 🛠 Getting Started
 
 Choose the path that fits what you want to do:
