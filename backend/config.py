@@ -3,6 +3,17 @@ import os
 NUM_VARIANTS = 4
 NUM_VARIANTS_VIDEO = 2
 
+
+def parse_truthy_env(name: str) -> bool:
+    """Read a boolean env var strictly.
+
+    Only the explicit truthy spellings ``1``/``true``/``yes``/``on`` (case-
+    and whitespace-insensitive) count as enabled; everything else — including
+    the string ``"false"`` — is disabled. This avoids the classic
+    ``bool("false") is True`` footgun.
+    """
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
 # LLM-related
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", None)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", None)
@@ -35,3 +46,11 @@ LOCAL_ASSET_BASE_URL = os.environ.get("LOCAL_ASSET_BASE_URL", "http://127.0.0.1:
 # Set to True when running in production (on the hosted version)
 # Used as a feature flag to enable or disable certain features
 IS_PROD = os.environ.get("IS_PROD", False)
+
+# Local coding-agent runner (e.g. a future Codex subprocess runner), selected
+# by the GENERATION_RUNNER env var. Unset/blank = disabled and unconfigured
+# (the safe default). When set, the value is a runner name looked up in the
+# runner registry; an unknown name selects nothing and yields a safe
+# "unavailable" reason at the capability endpoint. Setting this never reads
+# or requires an API key, and never launches a vendor CLI.
+GENERATION_RUNNER = os.environ.get("GENERATION_RUNNER", "").strip() or None
