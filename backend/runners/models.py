@@ -141,6 +141,15 @@ class GenerationInput(BaseModel):
         _reject_blank_entries(value)
         return value
 
+    @field_validator("design_system")
+    @classmethod
+    def _design_system_not_blank(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError("design_system must not be blank")
+        return value
+
 
 class GenerationResult(BaseModel):
     """Validated outcome of a completed generation.
@@ -218,6 +227,16 @@ class SetCodeEvent(BaseModel):
     file_name: str
     code: str
 
+    @field_validator("file_name")
+    @classmethod
+    def _file_name_is_safe(cls, value: str) -> str:
+        return _validate_relative_path(value)
+
+    @field_validator("code")
+    @classmethod
+    def _code_has_no_nul(cls, value: str) -> str:
+        return _validate_text_content(value)
+
 
 class ErrorEvent(BaseModel):
     type: Literal["error"] = "error"
@@ -229,6 +248,11 @@ class CompleteEvent(BaseModel):
     result: Optional[GenerationResult] = None
 
 
+# Normalized stream event yielded by a runner's ``generate()``.
+#
+# A generation stream terminates with exactly one ``CompleteEvent`` (carrying
+# the ``GenerationResult``) on success, or one ``ErrorEvent`` before the stream
+# ends on failure. No events are yielded after the terminal event.
 GenerationEvent = Annotated[
     Union[
         StatusEvent,
@@ -240,12 +264,6 @@ GenerationEvent = Annotated[
     ],
     Field(discriminator="type"),
 ]
-"""Normalized stream event yielded by a runner's ``generate()``.
-
-A generation stream terminates with exactly one ``CompleteEvent`` (carrying the
-``GenerationResult``) on success, or one ``ErrorEvent`` before the stream ends
-on failure.
-"""
 
 
 class RunnerCapabilities(BaseModel):

@@ -140,6 +140,29 @@ def test_generation_input_rejects_blank_prior_file() -> None:
         )
 
 
+def test_generation_input_accepts_nonblank_design_system() -> None:
+    gen_input = GenerationInput(
+        request_id="r",
+        prompt="p",
+        stack="html_tailwind",
+        generation_type="create",
+        design_system="Use the brand colors",
+    )
+    assert gen_input.design_system == "Use the brand colors"
+
+
+def test_generation_input_rejects_blank_design_system() -> None:
+    for bad in ("", "   ", "\t\n"):
+        with pytest.raises(ValidationError):
+            GenerationInput(
+                request_id="r",
+                prompt="p",
+                stack="html_tailwind",
+                generation_type="create",
+                design_system=bad,
+            )
+
+
 # --- GenerationResult -------------------------------------------------------
 
 
@@ -323,6 +346,34 @@ def test_complete_event_carries_result() -> None:
     assert event.result == result
     assert event.result is not None
     assert event.result.primary_path == "index.html"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        "",  # empty
+        "   ",  # whitespace only
+        "/abs/index.html",  # absolute
+        "a/../b.txt",  # parent traversal
+        "a/./b.txt",  # dot segment
+        "a//b.txt",  # empty segment
+        "a\\b.txt",  # backslash separator
+        "C:/index.html",  # drive letter
+    ],
+)
+def test_set_code_event_rejects_unsafe_file_name(bad_name: str) -> None:
+    with pytest.raises(ValidationError):
+        SetCodeEvent(file_name=bad_name, code="<html>")
+
+
+def test_set_code_event_rejects_nul_byte_in_file_name() -> None:
+    with pytest.raises(ValidationError):
+        SetCodeEvent(file_name="a\x00b.html", code="<html>")
+
+
+def test_set_code_event_rejects_nul_byte_in_code() -> None:
+    with pytest.raises(ValidationError):
+        SetCodeEvent(file_name="index.html", code="a\x00b")
 
 
 # --- Capabilities / probe / state ------------------------------------------
