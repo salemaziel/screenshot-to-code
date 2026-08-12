@@ -42,10 +42,13 @@ MCP server exposing the same backend to agents.
 | Authentication | Developer API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `REPLICATE_API_KEY`) | Existing vendor CLI sign-in on your host (Codex CLI first) |
 | Generation | In-process provider agents calling vendor HTTP APIs | Local runner adapters invoking the vendor CLI in a sandboxed, ephemeral workspace |
 | Agent access | WebUI only (WebSocket) | WebUI + local HTTP job API + MCP server |
-| Status | **Ships today** | **Planned — not implemented** |
+| Status | **Ships today** | **Foundation shipped; Codex runtime planned** |
 
-**Status:** everything described for the subscription-CLI mode is *planned, not shipped*. The
-only generation path that exists today is the upstream API-key mode documented below. The
+**Status: foundation shipped; Codex runtime planned.** The provider-neutral runner
+contracts (data models, protocol, registry) and capability-reporting integration have
+shipped. The Codex subprocess runner, WebSocket routing through it, HTTP job API, MCP
+server, and client CLI are planned but not yet implemented. The only generation path
+that works today is the upstream API-key mode documented below. The
 subscription-CLI mode is not an OpenAI-compatible proxy, does not read or copy vendor OAuth
 credentials, and is intended for a user-controlled host bound to loopback by default. See
 [docs/architecture/subscription-cli-mode.md](docs/architecture/subscription-cli-mode.md) for the

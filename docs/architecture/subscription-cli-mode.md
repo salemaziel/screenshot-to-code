@@ -1,8 +1,10 @@
 # Subscription-CLI Mode (local) — Architecture
 
-> **Status: planned.** None of the subscription-CLI runtime described here has shipped. This
-> document records the fork's intended direction and its current baseline relative to
-> upstream. The only code-generation path that works today is the upstream API-key mode.
+> **Status: foundation shipped; Codex runtime planned.** The provider-neutral runner
+> contracts (data models, protocol, registry, and capability reporting) have shipped.
+> The Codex subprocess runner, WebSocket routing through it, local HTTP job API, MCP
+> server, and client CLI are planned but not yet implemented. The only code-generation
+> path that works today is the upstream API-key mode.
 
 ## 1. Purpose
 
@@ -58,16 +60,33 @@ Key decisions:
 - WebSocket generation pipeline: `backend/routes/generate_code.py` /
   `frontend/src/generateCode.ts`.
 - Settings UI for API keys: `frontend/src/components/settings/SettingsTab.tsx`.
-- `GET /api/capabilities`, which currently reports only screenshot-preview availability
-  (`backend/routes/capabilities.py`).
+- `GET /api/capabilities`, which reports screenshot-preview availability and local-runner
+  state (configured but not probed — never launches a vendor CLI).
+  (`backend/routes/capabilities.py`, `backend/runners/capabilities.py`).
 - Provider session protocol (`backend/agent/providers/base.py`) and agent/file-state lifecycle
   (`backend/agent/engine.py`).
 
+### Shipped in this fork (runner contracts foundation)
+
+- **Provider-neutral runner contracts** (`backend/runners/`): data models
+  (`GenerationInput`, `GenerationResult`, `GenerationEvent` discriminated union,
+  `SetCodeEvent` with path validation, `RunnerCapabilities`, `ProbeResult`,
+  `LocalRunnerState`), the `Runner` protocol, and an empty explicit runner registry.
+- **`GENERATION_RUNNER` config** (`backend/config.py`): unset/blank by default
+  (disabled); when set, the value is a runner name looked up in the registry. Setting
+  this never reads or requires an API key and never launches a vendor CLI.
+- **Capability reporting** (`GET /api/capabilities` returns `local_runner` state
+  with `enabled`, `name`, `available`, `unavailable_reason`, `supported_stacks`,
+  and `supported_input_modes` — computed from configuration and the registry only,
+  without probing or executing a vendor CLI).
+- **Unit tests** for models and registry (`backend/tests/runners/`).
+
+The existing API-key generation path remains present and untouched.
+
 ### Planned (not yet implemented)
 
-- **Runner layer** (`backend/runners/`): a provider-neutral request/result contract, a runner
-  registry, capability probing, and the `CodexCliRunner` subprocess adapter with an ephemeral
-  workspace and a read-only sandbox. This directory does not exist yet.
+- **`CodexCliRunner` subprocess adapter** with an ephemeral workspace and a read-only
+  sandbox. No concrete runner is registered yet; the registry is empty.
 - **WebSocket path through the runner**, preserving the existing client event names so the
   first UI change is minimal.
 - **Local HTTP job API** (`POST /v1/jobs`, status/result reads, idempotent cancel) plus a
@@ -103,10 +122,10 @@ Key decisions:
 
 - This repository is a fork of
   [`abi/screenshot-to-code`](https://github.com/abi/screenshot-to-code) (MIT).
-- As of this work session, the fork (`origin/main`) and upstream (`upstream/main`) share commit
-  `d026163f586dfa8c5c10d28c36edd59a9d3b0e88` — the fork has not yet diverged.
-- That is a point-in-time snapshot, not a claim of continuing synchronization. Divergence is
-  introduced only by the planned changes above.
+- The last common commit with upstream is `d026163f586dfa8c5c10d28c36edd59a9d3b0e88`.
+  HEAD is 3 commits ahead of that baseline: the initial architecture documentation
+  plus two runner-contracts commits.
+- That is a point-in-time divergence marker, not a claim of continuing synchronization.
 
 ## 6. Out of scope for v0.1
 
