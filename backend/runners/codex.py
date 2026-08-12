@@ -28,6 +28,10 @@ _PROBE_ARGV = ("codex", "--version")
 # Short, explicit bound on the probe subprocess.
 _PROBE_TIMEOUT_SECONDS = 5.0
 
+# Short, fixed bound on each cleanup wait step; keeps stop+reap bounded even if
+# the child ignores SIGTERM (and SIGKILL).
+_PROBE_CLEANUP_TIMEOUT_SECONDS = 1.0
+
 # Short, generic, safe reasons — must never leak raw command output.
 _MISSING_REASON = "codex binary not found"
 _TIMEOUT_REASON = "codex probe timed out"
@@ -70,19 +74,48 @@ class CodexCliRunner:
             await asyncio.wait_for(proc.communicate(), timeout=_PROBE_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             # Stop and reap the child before returning; never leak a live process.
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+            await self._terminate_and_reap(proc)
             return ProbeResult(available=False, unavailable_reason=_TIMEOUT_REASON)
 
         if proc.returncode == 0:
             return ProbeResult(available=True)
         return ProbeResult(available=False, unavailable_reason=_NONZERO_REASON)
+
+    async def _terminate_and_reap(self, proc: asyncio.subprocess.Process) -> None:
+        """Stop and reap an unresponsive probe child within a fixed bound.
+
+        Escalates exactly ``terminate()`` -> bounded ``wait()`` -> ``kill()`` ->
+        bounded ``wait()`` so a child that ignores SIGTERM can never hang
+        cleanup. Only ``ProcessLookupError`` (child already gone) is swallowed;
+        any other exception propagates.
+        """
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return  # already reaped elsewhere; nothing left to do
+
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=_PROBE_CLEANUP_TIMEOUT_SECONDS
+            )
+            return
+        except ProcessLookupError:
+            return
+        except asyncio.TimeoutError:
+            pass  # SIGTERM ignored; escalate to SIGKILL
+
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(
+                proc.wait(), timeout=_PROBE_CLEANUP_TIMEOUT_SECONDS
+            )
+        except (ProcessLookupError, asyncio.TimeoutError):
+            # Already reaped, or the child ignores SIGKILL too — best effort done.
+            pass
 
     def generate(
         self, generation_input: GenerationInput

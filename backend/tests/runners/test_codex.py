@@ -171,6 +171,65 @@ async def test_probe_timeout_terminates_and_reaps_child(
     assert proc.awaited
 
 
+class _SigtermIgnoringProcess:
+    """A child whose communicate() hangs and which ignores SIGTERM.
+
+    Its first wait() (after terminate) never returns, so cleanup must escalate
+    to kill(); the second wait() (after kill) reaps with returncode -9.
+    """
+
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.returncode: Optional[int] = None
+        self.wait_calls = 0
+
+    async def communicate(self) -> tuple:
+        await asyncio.Event().wait()
+        return b"", b""  # pragma: no cover - unreachable by design
+
+    def terminate(self) -> None:
+        self.terminated = True
+        # SIGTERM is ignored: returncode stays None.
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        if self.returncode is None:
+            await asyncio.Event().wait()  # hang until killed
+        assert self.returncode is not None
+        return self.returncode
+
+
+async def test_probe_timeout_escalates_to_kill_when_sigterm_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child that ignores SIGTERM must be SIGKILLed and reaped, not hang."""
+
+    proc = _SigtermIgnoringProcess()
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> _SigtermIgnoringProcess:
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("runners.codex._PROBE_TIMEOUT_SECONDS", 0.05)
+
+    # Outer bound so a missing escalation fails fast instead of hanging the
+    # suite (the pre-fix code blocks forever on an unbounded await proc.wait()).
+    result = await asyncio.wait_for(CodexCliRunner().probe(), timeout=2.0)
+
+    assert result == ProbeResult(
+        available=False, unavailable_reason="codex probe timed out"
+    )
+    # Escalation happened exactly: SIGTERM ignored -> SIGKILL -> eventual reap.
+    assert proc.terminated
+    assert proc.killed
+    assert proc.wait_calls >= 2
+
+
 async def test_probe_nonzero_exit_returns_safe_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
