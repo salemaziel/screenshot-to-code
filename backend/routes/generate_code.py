@@ -110,7 +110,6 @@ _LOCAL_UNSUPPORTED_MESSAGE = (
     "This request is not supported by the configured local runner."
 )
 _LOCAL_RUNNER_UNAVAILABLE_FALLBACK = "The local runner is not available."
-_MAX_UNAVAILABLE_REASON_LENGTH = 500
 
 
 @dataclass
@@ -864,12 +863,14 @@ async def _probe_runner_once(runner: Runner) -> ProbeResult:
         return result
 
 
-def _safe_unavailable_reason(reason: str | None) -> str:
-    """Bound and clean a probe's unavailable reason; fall back when unusable."""
-    if reason:
-        cleaned = reason.strip()
-        if cleaned:
-            return cleaned[:_MAX_UNAVAILABLE_REASON_LENGTH]
+def _safe_unavailable_reason() -> str:
+    """Return the fixed client-safe fallback for an unavailable local runner.
+
+    Runner-controlled ``ProbeResult.unavailable_reason`` is never forwarded to
+    the browser: a future runner could return exception text, secrets,
+    provider/model identifiers, or filesystem paths there. Every unavailable
+    probe therefore maps to this one fixed message.
+    """
     return _LOCAL_RUNNER_UNAVAILABLE_FALLBACK
 
 
@@ -1143,9 +1144,7 @@ class CodeGenerationMiddleware(Middleware):
 
         probe = await _probe_runner_once(runner)
         if not probe.available:
-            await context.send_message(
-                "variantError", _safe_unavailable_reason(probe.unavailable_reason), 0
-            )
+            await context.send_message("variantError", _safe_unavailable_reason(), 0)
             return
 
         events = _expand_complete_text_files(runner.generate(generation_input))

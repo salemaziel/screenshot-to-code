@@ -30,6 +30,7 @@ from routes.generate_code import (
     PipelineContext,
     PromptCreationMiddleware,
     StatusBroadcastMiddleware,
+    _LOCAL_RUNNER_UNAVAILABLE_FALLBACK,
     _expand_complete_text_files,
     _local_dispatch_decision,
     _probe_runner_once,
@@ -176,6 +177,28 @@ class YieldingProbeRunner(FakeRunner):
         return ProbeResult(
             available=self._available, unavailable_reason=self._unavailable_reason
         )
+
+
+HOSTILE_PROBE_TEXT = (
+    "probe crashed in /home/user/.secret with token sk-abc123 "
+    "provider codex model gpt-5"
+)
+
+
+class HostileProbeRunner(FakeRunner):
+    """A runner whose ``probe()`` raises with hostile details in the message.
+
+    Pins ``_probe_runner_once``'s exception handling: the exception must be
+    swallowed into an unavailable ``ProbeResult`` (never propagated), and its
+    text must never reach the socket.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(available=True)
+
+    async def probe(self) -> ProbeResult:
+        self.probe_calls += 1
+        raise RuntimeError(HOSTILE_PROBE_TEXT)
 
 
 @pytest.fixture
@@ -459,7 +482,11 @@ async def test_probe_runs_once_under_concurrent_requests(
 async def test_unavailable_probe_fails_closed_with_single_variant_error(
     empty_registry, codex_configured
 ) -> None:
-    """An unavailable probe emits one safe variantError; no generate/fallback."""
+    """An unavailable probe emits one safe variantError; no generate/fallback.
+
+    The runner-supplied ``unavailable_reason`` is never forwarded: local
+    dispatch always emits the fixed client-safe fallback.
+    """
     runner = FakeRunner(available=False, unavailable_reason="codex binary not found")
     registry.register("codex", runner)
     sent_messages: List[tuple[str, str | None, int]] = []
@@ -475,11 +502,46 @@ async def test_unavailable_probe_fails_closed_with_single_variant_error(
 
     assert runner.probe_calls == 1
     assert runner.generate_calls == 0
-    # Exactly one variantError carrying the bounded reason; no variantComplete.
+    # Exactly one variantError carrying the fixed fallback; no variantComplete.
     assert [m[0] for m in sent_messages] == ["variantError"]
-    assert sent_messages[0][1] == "codex binary not found"
+    value = sent_messages[0][1]
+    assert isinstance(value, str)
+    assert value == _LOCAL_RUNNER_UNAVAILABLE_FALLBACK
+    # The runner-controlled reason must never reach the browser.
+    assert "codex binary not found" not in value
     assert next_called is False
     context.ws_comm.throw_error.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_probe_exception_fails_closed_with_fixed_fallback(
+    empty_registry, codex_configured
+) -> None:
+    """A probe() that raises fails closed to the fixed fallback; no leak."""
+    runner = HostileProbeRunner()
+    registry.register("codex", runner)
+    sent_messages: List[tuple[str, str | None, int]] = []
+    context = _make_context(_extracted(), sent_messages)
+
+    next_called = False
+
+    async def next_func() -> None:
+        nonlocal next_called
+        next_called = True
+
+    await CodeGenerationMiddleware().process(context, next_func)
+
+    assert runner.probe_calls == 1
+    assert runner.generate_calls == 0
+    # Exactly one fixed-fallback variantError; no variantComplete/fallthrough.
+    assert sent_messages == [("variantError", _LOCAL_RUNNER_UNAVAILABLE_FALLBACK, 0)]
+    assert next_called is False
+    context.ws_comm.throw_error.assert_not_awaited()  # type: ignore[attr-defined]
+    # Hostile exception contents must never reach the sent message.
+    value = sent_messages[0][1]
+    assert isinstance(value, str)
+    for token in ("Traceback", "/home/user/.secret", "sk-abc123", "gpt-5"):
+        assert token not in value
 
 
 @pytest.mark.asyncio
