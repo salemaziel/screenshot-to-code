@@ -44,11 +44,25 @@ _PROBE_CLEANUP_TIMEOUT_SECONDS = 1.0
 _GENERATE_TIMEOUT_SECONDS = 300.0
 _GENERATE_CLEANUP_TIMEOUT_SECONDS = 2.0
 
+# Fixed, deterministic resource limits for generate(). Every enforcement is
+# fail-closed: an over-limit prompt is rejected before any subprocess starts,
+# an over-limit stream terminates the child, and an over-limit output artifact
+# is never decoded or returned.
+_MAX_PROMPT_UTF8_BYTES = 256 * 1024  # prompt cap, checked before spawning
+_MAX_STREAM_BYTES = 4 * 1024 * 1024  # per-stream (stdout/stderr) drain cap
+_STREAM_READ_CHUNK_BYTES = 64 * 1024  # bounded pipe read size
+_MAX_OUTPUT_ARTIFACT_BYTES = 32 * 1024 * 1024  # raw output artifact cap
+_MAX_OUTPUT_FILE_COUNT = 200  # max returned file count
+_MAX_OUTPUT_FILE_BYTES = 1024 * 1024  # per-file UTF-8 byte cap
+_MAX_OUTPUT_TOTAL_BYTES = 8 * 1024 * 1024  # aggregate returned-file byte cap
+
 # Short, generic, safe reasons — must never leak raw command output.
 _MISSING_REASON = "codex binary not found"
 _TIMEOUT_REASON = "codex probe timed out"
 _NONZERO_REASON = "codex binary exited with an error"
 _GENERATION_ERROR_REASON = "codex generation failed"
+_PROMPT_LIMIT_REASON = "codex prompt exceeds allowed size"
+_OUTPUT_LIMIT_REASON = "codex output exceeds allowed limits"
 
 # Declared capability shape: exactly the four local stacks and image+text input.
 _SUPPORTED_STACKS: list[RunnerStack] = [
@@ -58,21 +72,6 @@ _SUPPORTED_STACKS: list[RunnerStack] = [
     "vue_tailwind",
 ]
 _SUPPORTED_INPUT_MODES: list[InputMode] = ["image", "text"]
-
-# Provider key environment variable prefixes to strip from the child env.
-_PROVIDER_KEY_PREFIXES = (
-    "OPENAI_",
-    "ANTHROPIC_",
-    "GEMINI_",
-    "GROQ_",
-    "DEEPSEEK_",
-    "REPLICATE_",
-    "COHERE_",
-    "MISTRAL_",
-    "AZURE_",
-    "AWS_",
-    "GOOGLE_",
-)
 
 
 def _build_child_env() -> dict[str, str]:
@@ -104,6 +103,60 @@ def _build_output_schema() -> dict:
         "required": ["primary_path", "files"],
         "additionalProperties": False,
     }
+
+
+class _StreamLimitExceeded(Exception):
+    """Internal signal: a subprocess stream exceeded its byte cap.
+
+    Never surfaced to callers; ``generate()`` converts it into a generic
+    ErrorEvent after stopping and reaping the child.
+    """
+
+
+async def _drain_capped(
+    stream: Optional[asyncio.StreamReader], cap: int
+) -> None:
+    """Read a subprocess stream to EOF in bounded chunks, capping total bytes.
+
+    Never buffers more than one chunk at a time, so a chatty child cannot
+    force unbounded pipe buffering in the parent. Exceeding ``cap`` raises
+    ``_StreamLimitExceeded`` immediately; the caller is responsible for
+    terminating the child.
+    """
+    if stream is None:
+        return
+    total = 0
+    while True:
+        chunk = await stream.read(_STREAM_READ_CHUNK_BYTES)
+        if not chunk:
+            return
+        total += len(chunk)
+        if total > cap:
+            raise _StreamLimitExceeded()
+
+
+async def _run_capped(
+    proc: asyncio.subprocess.Process, stdin_bytes: bytes
+) -> None:
+    """Feed stdin and drain stdout/stderr to EOF under fixed byte caps.
+
+    Mirrors ``Process.communicate()`` except each stream is drained in
+    bounded chunks with a hard byte cap, so an over-limit child is detected
+    and signalled (``_StreamLimitExceeded``) instead of buffered unboundedly.
+    """
+    stdin = proc.stdin
+    if stdin is not None:
+        try:
+            stdin.write(stdin_bytes)
+            await stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # child already exited; the drains below surface the rest
+        stdin.close()
+
+    await asyncio.gather(
+        _drain_capped(proc.stdout, _MAX_STREAM_BYTES),
+        _drain_capped(proc.stderr, _MAX_STREAM_BYTES),
+    )
 
 
 class CodexCliRunner:
@@ -195,6 +248,17 @@ class CodexCliRunner:
             yield ErrorEvent(message="image input is not yet supported for codex")
             return
 
+        # Encode the prompt before spawning; an over-limit prompt never
+        # starts a subprocess.
+        try:
+            prompt_bytes = generation_input.prompt.encode("utf-8")
+        except UnicodeEncodeError:
+            yield ErrorEvent(message=_GENERATION_ERROR_REASON)
+            return
+        if len(prompt_bytes) > _MAX_PROMPT_UTF8_BYTES:
+            yield ErrorEvent(message=_PROMPT_LIMIT_REASON)
+            return
+
         # Build the workspace directory and output files.
         with tempfile.TemporaryDirectory(prefix="codex_ws_") as workspace:
             output_schema_path = os.path.join(workspace, "output_schema.json")
@@ -242,12 +306,13 @@ class CodexCliRunner:
                 return
 
             try:
-                # Send prompt via stdin, then wait for the child.
+                # Feed the prompt on stdin, then drain stdout/stderr under
+                # byte caps so a chatty child cannot buffer unbounded data.
+                proc = self._active_proc
+                assert proc is not None  # set by the spawn step above
                 try:
-                    stdout_bytes, _ = await asyncio.wait_for(
-                        self._active_proc.communicate(
-                            generation_input.prompt.encode("utf-8")
-                        ),
+                    await asyncio.wait_for(
+                        _run_capped(proc, prompt_bytes),
                         timeout=_GENERATE_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
@@ -256,8 +321,14 @@ class CodexCliRunner:
                     self._cancelled = False
                     yield ErrorEvent(message=_GENERATION_ERROR_REASON)
                     return
+                except _StreamLimitExceeded:
+                    await self._terminate_generate_child()
+                    self._active_proc = None
+                    self._cancelled = False
+                    yield ErrorEvent(message=_OUTPUT_LIMIT_REASON)
+                    return
 
-                # Check whether cancellation was requested during communicate.
+                # Check whether cancellation was requested during the run.
                 if self._cancelled:
                     await self._terminate_generate_child()
                     self._active_proc = None
@@ -267,9 +338,7 @@ class CodexCliRunner:
 
                 # Read and validate the output artifact.
                 try:
-                    event = self._parse_output_file(
-                        output_file_path, generation_input.request_id
-                    )
+                    event = self._parse_output_file(output_file_path)
                 except Exception:
                     event = ErrorEvent(message=_GENERATION_ERROR_REASON)
 
@@ -312,25 +381,37 @@ class CodexCliRunner:
         except (ProcessLookupError, asyncio.TimeoutError):
             pass
 
-    def _parse_output_file(
-        self, output_file_path: str, request_id: str
-    ) -> CompleteEvent:
+    def _parse_output_file(self, output_file_path: str) -> CompleteEvent:
         """Parse and validate the --output-last-message artifact.
+
+        The raw artifact is size-capped before it is read or decoded; the
+        returned file count, per-file bytes, and aggregate bytes are bounded
+        afterwards. ``primary_path`` is required by the output schema and is
+        never silently accepted as missing or blank.
 
         Returns a CompleteEvent on success; raises on validation failure.
         """
-        raw = Path(output_file_path).read_text(encoding="utf-8")
-        data = json.loads(raw)
+        # Fail fast on an oversized artifact: stat before reading, and
+        # re-check the bounded read so a file that grew between stat and
+        # read is still caught.
+        if os.path.getsize(output_file_path) > _MAX_OUTPUT_ARTIFACT_BYTES:
+            raise ValueError("output artifact exceeds size limit")
+        with open(output_file_path, "rb") as artifact:
+            raw = artifact.read(_MAX_OUTPUT_ARTIFACT_BYTES + 1)
+        if len(raw) > _MAX_OUTPUT_ARTIFACT_BYTES:
+            raise ValueError("output artifact exceeds size limit")
+        data = json.loads(raw.decode("utf-8"))
 
-        primary_path = str(data.get("primary_path", ""))
         files_raw = data.get("files", {})
-
         if not isinstance(files_raw, dict):
             raise ValueError("files must be a JSON object")
+        if len(files_raw) > _MAX_OUTPUT_FILE_COUNT:
+            raise ValueError("output contains too many files")
 
-        # Validate each file entry.
+        # Validate each file entry under the per-file and aggregate caps.
         text_files: dict[str, str] = {}
         seen_paths: set[str] = set()
+        total_bytes = 0
         for key, content in files_raw.items():
             # Validate path safety.
             safe_key = self._validate_output_path(str(key))
@@ -342,14 +423,23 @@ class CodexCliRunner:
                 raise ValueError("output file content must be non-empty text")
             if "\x00" in content:
                 raise ValueError("output file content must not contain NUL bytes")
+            content_bytes = content.encode("utf-8")
+            if len(content_bytes) > _MAX_OUTPUT_FILE_BYTES:
+                raise ValueError("output file exceeds size limit")
+            total_bytes += len(content_bytes)
+            if total_bytes > _MAX_OUTPUT_TOTAL_BYTES:
+                raise ValueError("output exceeds total size limit")
             text_files[safe_key] = content
 
         if not text_files:
             raise ValueError("output must contain at least one file")
 
-        # Validate primary_path.
-        safe_primary = self._validate_output_path(primary_path) if primary_path else None
-        if safe_primary is not None and safe_primary not in text_files:
+        # Validate primary_path: required, non-empty, and one of the keys.
+        primary_raw = data.get("primary_path")
+        if not isinstance(primary_raw, str) or not primary_raw.strip():
+            raise ValueError("primary_path is required and must be non-empty")
+        safe_primary = self._validate_output_path(primary_raw)
+        if safe_primary not in text_files:
             raise ValueError(
                 "primary_path must be one of the output file keys"
             )

@@ -257,11 +257,56 @@ async def test_probe_nonzero_exit_returns_safe_unavailable(
 # --- generate() ---------------------------------------------------------------
 
 
+class _FakeStreamWriter:
+    """Minimal stand-in for asyncio.StreamWriter (the child stdin pipe)."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.data.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeStreamReader:
+    """Minimal stand-in for asyncio.StreamReader (a child stdout/stderr pipe).
+
+    ``chunks`` are handed out one per ``read()`` call; EOF (b"") is returned
+    once the queue is exhausted.
+    """
+
+    def __init__(self, chunks: Optional[List[bytes]] = None) -> None:
+        self._chunks: List[bytes] = list(chunks or [])
+
+    async def read(self, n: int = -1) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+class _BlockingStreamReader(_FakeStreamReader):
+    """A reader whose read() blocks until the given event is set (EOF)."""
+
+    def __init__(self, unblock: asyncio.Event) -> None:
+        super().__init__()
+        self._unblock = unblock
+
+    async def read(self, n: int = -1) -> bytes:
+        await self._unblock.wait()
+        return b""
+
+
 class _GenerateFakeProcess:
     """Fake asyncio.subprocess.Process for generate() tests.
 
-    Writes the supplied output JSON to a temporary file (simulating
-    ``--output-last-message``), then returns code 0 via communicate().
+    Exposes stdin/stdout/stderr stream stand-ins plus the process control
+    surface (terminate/kill/wait) the runner's cleanup paths rely on.
     """
 
     def __init__(
@@ -269,19 +314,28 @@ class _GenerateFakeProcess:
         output_json: object,
         returncode: int = 0,
         stderr: bytes = b"",
-    ):
+        *,
+        stdin: Optional[_FakeStreamWriter] = None,
+        stdout: Optional[_FakeStreamReader] = None,
+    ) -> None:
         self.returncode: Optional[int] = None
         self._output_json = output_json
         self._retcode = returncode
-        self._stderr = stderr
         self.terminated = False
         self.killed = False
-        self._output_file: Optional[Path] = None
-
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
-        return b"", self._stderr
+        self.waited = False
+        self.stdin: _FakeStreamWriter = (
+            stdin if stdin is not None else _FakeStreamWriter()
+        )
+        self.stdout: _FakeStreamReader = (
+            stdout if stdout is not None else _FakeStreamReader()
+        )
+        self.stderr: _FakeStreamReader = _FakeStreamReader(
+            chunks=[stderr] if stderr else []
+        )
 
     async def wait(self) -> int:
+        self.waited = True
         if self.returncode is None:
             self.returncode = self._retcode
         return self.returncode
@@ -294,11 +348,14 @@ class _GenerateFakeProcess:
 
 
 def _fake_exec_success(
-    output_schema_path: str,
+    output_schema_path: str = "",
+    *,
+    writer: Optional[_FakeStreamWriter] = None,
 ) -> Any:
     """Return a factory that creates a successful fake process.
 
-    Parses the output-schema path from the argv to write a dummy result file.
+    Parses the output-schema/output-last-message paths from the argv to write
+    a dummy result file, mirroring ``codex exec --output-last-message``.
     """
 
     async def _factory(*args: Any, **kwargs: Any) -> _GenerateFakeProcess:
@@ -313,7 +370,7 @@ def _fake_exec_success(
 
         # Write the output-schema file
         if schema_path:
-            schema = {
+            schema: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "primary_path": {"type": "string"},
@@ -328,14 +385,14 @@ def _fake_exec_success(
             Path(schema_path).write_text(json.dumps(schema))
 
         # Write the output-last-message file with the result
+        result: dict[str, Any] = {
+            "primary_path": "index.html",
+            "files": {"index.html": "<html><body>Hello</body></html>"},
+        }
         if output_path:
-            result = {
-                "primary_path": "index.html",
-                "files": {"index.html": "<html><body>Hello</body></html>"},
-            }
             Path(output_path).write_text(json.dumps(result))
 
-        return _GenerateFakeProcess(output_json=result)
+        return _GenerateFakeProcess(output_json=result, stdin=writer)
 
     return _factory
 
@@ -379,28 +436,26 @@ async def test_cancel_stops_active_child_and_yields_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Cancel() on an active generation terminates the child and generate yields ErrorEvent."""
-    cancelled = asyncio.Event()
+    unblock = asyncio.Event()
 
     class _HangingGenerateProcess:
         def __init__(self):
             self.returncode = None
             self.terminated = False
             self.killed = False
-            self._done = asyncio.Event()
-
-        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
-            # Hang until cancelled signals.
-            await cancelled.wait()
-            return b"", b""
+            self.stdin = _FakeStreamWriter()
+            self.stdout = _BlockingStreamReader(unblock)
+            self.stderr = _FakeStreamReader()
 
         async def wait(self) -> int:
-            await self._done.wait()
-            return -15
+            # Hang until terminated; the runner's cleanup awaits this.
+            await unblock.wait()
+            self.returncode = -15
+            return self.returncode
 
         def terminate(self) -> None:
             self.terminated = True
-            self._done.set()
-            cancelled.set()
+            unblock.set()
 
         def kill(self) -> None:
             self.killed = True
@@ -524,3 +579,280 @@ async def test_generate_fails_on_malformed_output_yields_error(
     assert isinstance(events[0], ErrorEvent)
     # Error message must be generic — never expose raw output.
     assert "not valid json" not in events[0].message
+
+
+# --- generate(): resource limits ---------------------------------------------
+
+
+_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "primary_path": {"type": "string"},
+        "files": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+    },
+    "required": ["primary_path", "files"],
+    "additionalProperties": False,
+}
+
+
+def _argv_paths(args: tuple[Any, ...]) -> tuple[str, str]:
+    """Extract (output_schema_path, output_last_message_path) from exec argv."""
+    schema_path = ""
+    output_path = ""
+    for i, a in enumerate(args):
+        if isinstance(a, str) and a == "--output-schema" and i + 1 < len(args):
+            schema_path = str(args[i + 1])
+        if isinstance(a, str) and a == "--output-last-message" and i + 1 < len(args):
+            output_path = str(args[i + 1])
+    return schema_path, output_path
+
+
+def _exec_factory_writing(
+    payload: object,
+    proc: Optional[_GenerateFakeProcess] = None,
+) -> Any:
+    """Return an exec factory that writes schema + the given output payload."""
+
+    async def _factory(*args: Any, **kwargs: Any) -> _GenerateFakeProcess:
+        schema_path, output_path = _argv_paths(args)
+        if schema_path:
+            Path(schema_path).write_text(json.dumps(_OUTPUT_SCHEMA))
+        if output_path:
+            Path(output_path).write_text(json.dumps(payload))
+        return proc if proc is not None else _GenerateFakeProcess(output_json=payload)
+
+    return _factory
+
+
+def _gen_input(prompt: str = "test") -> GenerationInput:
+    return GenerationInput(
+        request_id="r1",
+        prompt=prompt,
+        stack="html_tailwind",
+        generation_type="create",
+    )
+
+
+async def _collect_events(
+    runner: CodexCliRunner, gen_input: GenerationInput
+) -> list[object]:
+    events: list[object] = []
+    async for event in runner.generate(gen_input):
+        events.append(event)
+    return events
+
+
+async def test_generate_prompt_too_large_does_not_spawn_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An over-limit prompt must be rejected before any subprocess is created."""
+    monkeypatch.setattr("runners.codex._MAX_PROMPT_UTF8_BYTES", 16)
+    spawns: list[tuple[Any, ...]] = []
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        spawns.append((args, kwargs))
+        raise AssertionError("must not spawn a subprocess for an over-limit prompt")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    events = await _collect_events(CodexCliRunner(), _gen_input(prompt="x" * 100))
+
+    assert spawns == []
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    # Generic message: no prompt contents or sizes leaked.
+    assert "x" * 4 not in events[0].message
+
+
+async def test_generate_prompt_limit_counts_utf8_bytes_not_characters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prompt cap is measured in UTF-8 bytes, not characters."""
+    monkeypatch.setattr("runners.codex._MAX_PROMPT_UTF8_BYTES", 8)
+    spawns: list[tuple[Any, ...]] = []
+
+    async def boom(*args: Any, **kwargs: Any) -> Any:
+        spawns.append((args, kwargs))
+        raise AssertionError("must not spawn a subprocess for an over-limit prompt")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", boom)
+
+    # 8 characters, each 2 bytes in UTF-8 -> 16 bytes total > 8-byte cap.
+    events = await _collect_events(CodexCliRunner(), _gen_input(prompt="é" * 8))
+
+    assert spawns == []
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+
+
+async def test_generate_writes_prompt_bytes_to_stdin_and_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prompt is delivered verbatim on stdin and the pipe is closed."""
+    writer = _FakeStreamWriter()
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _fake_exec_success(writer=writer)
+    )
+
+    events = await _collect_events(
+        CodexCliRunner(), _gen_input(prompt="Build a hello world page")
+    )
+
+    assert len(events) == 1
+    assert isinstance(events[0], CompleteEvent)
+    assert bytes(writer.data) == "Build a hello world page".encode("utf-8")
+    assert writer.closed
+
+
+async def test_generate_stdout_overflow_terminates_child_and_yields_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chatty stdout beyond the cap stops/reaps the child and yields a generic error."""
+    monkeypatch.setattr("runners.codex._MAX_STREAM_BYTES", 16)
+    proc = _GenerateFakeProcess(
+        output_json={},
+        stdout=_FakeStreamReader(chunks=[b"z" * 64]),
+    )
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing({}, proc=proc)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert "z" * 4 not in events[0].message  # raw output must never leak
+    # The overflowing child was stopped and reaped before returning.
+    assert proc.terminated or proc.killed
+    assert proc.waited
+
+
+async def test_generate_stderr_overflow_terminates_child_and_yields_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chatty stderr beyond the cap stops/reaps the child and yields a generic error."""
+    monkeypatch.setattr("runners.codex._MAX_STREAM_BYTES", 16)
+    proc = _GenerateFakeProcess(output_json={}, stderr=b"w" * 64)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing({}, proc=proc)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert "w" * 4 not in events[0].message  # raw output must never leak
+    assert proc.terminated or proc.killed
+    assert proc.waited
+
+
+async def test_generate_output_artifact_too_large_yields_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raw --output-last-message artifact is size-capped before decoding."""
+    monkeypatch.setattr("runners.codex._MAX_OUTPUT_ARTIFACT_BYTES", 1024)
+    payload: dict[str, Any] = {
+        "primary_path": "index.html",
+        "files": {"index.html": "q" * 4096},
+    }
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert "q" * 8 not in events[0].message
+
+
+async def test_generate_rejects_too_many_output_files(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More output files than the cap yields a generic error."""
+    monkeypatch.setattr("runners.codex._MAX_OUTPUT_FILE_COUNT", 2)
+    payload: dict[str, Any] = {
+        "primary_path": "a.txt",
+        "files": {"a.txt": "a", "b.txt": "b", "c.txt": "c"},
+    }
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+
+
+async def test_generate_rejects_oversized_output_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single output file over the per-file byte cap yields a generic error."""
+    monkeypatch.setattr("runners.codex._MAX_OUTPUT_FILE_BYTES", 16)
+    payload: dict[str, Any] = {
+        "primary_path": "big.txt",
+        "files": {"big.txt": "y" * 64},
+    }
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    assert "y" * 4 not in events[0].message
+
+
+async def test_generate_rejects_excessive_total_output_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The aggregate returned-file byte cap is enforced independently of per-file caps."""
+    monkeypatch.setattr("runners.codex._MAX_OUTPUT_TOTAL_BYTES", 24)
+    # Each file is under the (default) per-file cap; the sum exceeds the cap.
+    payload: dict[str, Any] = {
+        "primary_path": "a.txt",
+        "files": {"a.txt": "a" * 12, "b.txt": "b" * 12, "c.txt": "c" * 12},
+    }
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+
+
+async def test_generate_missing_primary_path_yields_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """primary_path is required by the schema; a missing one must fail."""
+    payload: dict[str, Any] = {"files": {"index.html": "<html></html>"}}
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+
+
+async def test_generate_empty_primary_path_yields_generic_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty primary_path must fail, never be silently accepted."""
+    payload: dict[str, Any] = {"primary_path": "", "files": {"index.html": "<html></html>"}}
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", _exec_factory_writing(payload)
+    )
+
+    events = await _collect_events(CodexCliRunner(), _gen_input())
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
