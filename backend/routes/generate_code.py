@@ -11,6 +11,7 @@ from starlette.websockets import WebSocketDisconnect
 from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
 from config import (
     ANTHROPIC_API_KEY,
+    GENERATION_RUNNER,
     GEMINI_API_KEY,
     IS_DEBUG_ENABLED,
     IS_PROD,
@@ -26,6 +27,7 @@ from llm import (
 )
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Coroutine,
     Dict,
@@ -34,6 +36,7 @@ from typing import (
     cast,
     get_args,
 )
+from weakref import WeakKeyDictionary
 from openai.types.chat import ChatCompletionMessageParam
 
 from utils import print_prompt_preview
@@ -63,6 +66,22 @@ from uploaded_assets import (
 )
 from agent.runner import Agent
 from fs_logging.agent_runs import AgentRunRecorder
+from routes.local_runner_adapter import LocalRunnerWebSocketAdapter
+from runners.base import Runner
+from runners.codex import CodexCliRunner
+from runners.models import (
+    CompleteEvent,
+    GenerationEvent,
+    GenerationInput,
+    ProbeResult,
+    RunnerStack,
+    SetCodeEvent,
+)
+from runners.registry import (
+    is_registered as runner_is_registered,
+    register as runner_register,
+    select as runner_select,
+)
 from routes.model_choice_sets import (
     ALL_KEYS_MODELS_DEFAULT,
     ALL_KEYS_MODELS_TEXT_CREATE,
@@ -81,6 +100,17 @@ from ws.constants import APP_ERROR_WEB_SOCKET_CODE  # type: ignore
 
 
 router = APIRouter()
+
+
+# Local-runner dispatch (v0.1): only the codex runner is ever registered and
+# selected. Fixed, client-safe failure messages — never interpolate runner
+# output, provider names, model identifiers, or artifact paths into these.
+_LOCAL_RUNNER_NAME = "codex"
+_LOCAL_UNSUPPORTED_MESSAGE = (
+    "This request is not supported by the configured local runner."
+)
+_LOCAL_RUNNER_UNAVAILABLE_FALLBACK = "The local runner is not available."
+_MAX_UNAVAILABLE_REASON_LENGTH = 500
 
 
 @dataclass
@@ -713,6 +743,188 @@ class AgenticGenerationStage:
             return ""
 
 
+# --- Local-runner registration, selection, and dispatch helpers ---------------
+
+
+def _ensure_configured_runner_registered() -> None:
+    """Register the configured Codex runner exactly once per process.
+
+    Only ``GENERATION_RUNNER == "codex"`` triggers registration (the config
+    value is already normalized by ``config``). Registration is side-effect
+    free: it never probes, launches a CLI, or reads credentials, and repeated
+    calls are idempotent so imports/reloads/tests are safe.
+    """
+    if GENERATION_RUNNER != _LOCAL_RUNNER_NAME:
+        return
+    if not runner_is_registered(_LOCAL_RUNNER_NAME):
+        runner_register(_LOCAL_RUNNER_NAME, CodexCliRunner())
+
+
+def _select_local_runner() -> Runner | None:
+    """Resolve the configured local runner, or None when not selected.
+
+    Returns None for unset/blank/unknown ``GENERATION_RUNNER`` values so the
+    legacy cloud path is preserved. Never probes or executes a CLI.
+    """
+    if GENERATION_RUNNER != _LOCAL_RUNNER_NAME:
+        return None
+    _ensure_configured_runner_registered()
+    return runner_select(GENERATION_RUNNER)
+
+
+@dataclass
+class LocalDispatchDecision:
+    """Whether the current request dispatches to a local runner.
+
+    ``runner`` is set whenever a local runner is configured (regardless of
+    request eligibility); ``eligible`` is True only when the request is within
+    the v0.1 local contract (text input only, stack declared by the runner).
+    """
+
+    runner: Runner | None = None
+    eligible: bool = False
+
+
+def _is_local_request_eligible(
+    extracted_params: ExtractedParams, runner: Runner
+) -> bool:
+    """v0.1 eligibility: text input only, stack declared by the runner.
+
+    Reads only the runner's declared ``capabilities()``, which is side-effect
+    free by contract — it never probes or launches a vendor CLI.
+    """
+    if extracted_params.input_mode != "text":
+        return False
+    if extracted_params.stack not in get_args(RunnerStack):
+        return False
+    caps = runner.capabilities()
+    if extracted_params.stack not in caps.supported_stacks:
+        return False
+    if extracted_params.input_mode not in caps.supported_input_modes:
+        return False
+    return True
+
+
+def _local_dispatch_decision(
+    extracted_params: ExtractedParams,
+) -> LocalDispatchDecision:
+    """Compute the local-dispatch decision for a request."""
+    runner = _select_local_runner()
+    if runner is None:
+        return LocalDispatchDecision()
+    return LocalDispatchDecision(
+        runner=runner,
+        eligible=_is_local_request_eligible(extracted_params, runner),
+    )
+
+
+# Probe outcomes cached per runner instance (weakly referenced, so test fakes
+# and module reloads never leak): the first eligible request probes exactly
+# once and later requests reuse the cached outcome.
+_local_runner_probe_cache: WeakKeyDictionary[Runner, ProbeResult] = (
+    WeakKeyDictionary()
+)
+
+# Per-runner locks serializing the probe so concurrent eligible requests on the
+# same runner still observe a single probe (the cache alone is racy: two
+# coroutines can both read a miss before either writes a result). Weakly keyed
+# for the same reason as the cache, and a fresh lock is created per runner
+# instance, so no lock is ever shared across event loops.
+_local_runner_probe_locks: WeakKeyDictionary[Runner, asyncio.Lock] = (
+    WeakKeyDictionary()
+)
+
+
+async def _probe_runner_once(runner: Runner) -> ProbeResult:
+    """Probe ``runner`` at most once per instance, caching the outcome.
+
+    A probe that raises is treated as unavailable with a fixed safe fallback;
+    the exception is never propagated into the socket path. The probe section
+    is guarded by a per-runner lock (with a re-check inside it) so concurrent
+    eligible requests observe a single probe.
+    """
+    cached = _local_runner_probe_cache.get(runner)
+    if cached is not None:
+        return cached
+
+    lock = _local_runner_probe_locks.get(runner)
+    if lock is None:
+        lock = asyncio.Lock()
+        _local_runner_probe_locks[runner] = lock
+
+    async with lock:
+        cached = _local_runner_probe_cache.get(runner)
+        if cached is not None:
+            return cached
+        try:
+            result = await runner.probe()
+        except Exception:
+            result = ProbeResult(available=False)
+        _local_runner_probe_cache[runner] = result
+        return result
+
+
+def _safe_unavailable_reason(reason: str | None) -> str:
+    """Bound and clean a probe's unavailable reason; fall back when unusable."""
+    if reason:
+        cleaned = reason.strip()
+        if cleaned:
+            return cleaned[:_MAX_UNAVAILABLE_REASON_LENGTH]
+    return _LOCAL_RUNNER_UNAVAILABLE_FALLBACK
+
+
+def _build_generation_input(
+    extracted_params: ExtractedParams, request_id: str
+) -> GenerationInput:
+    """Build a server-owned GenerationInput for local dispatch.
+
+    Never carries user/client filesystem paths: ``request_id`` is a
+    server-created UUID, ``input_image`` is always None, and ``prior_files``
+    is intentionally empty in this slice (a client-supplied file_state path is
+    never forwarded).
+    """
+    prompt_text = (
+        extracted_params.prompt.get("full_text")
+        or extracted_params.prompt.get("text")
+        or ""
+    )
+    return GenerationInput(
+        request_id=request_id,
+        prompt=prompt_text,
+        stack=cast(RunnerStack, extracted_params.stack),
+        generation_type=extracted_params.generation_type,
+        design_system=extracted_params.design_system,
+    )
+
+
+async def _expand_complete_text_files(
+    events: AsyncIterator[GenerationEvent],
+) -> AsyncIterator[GenerationEvent]:
+    """Expand a terminal CompleteEvent's text_files into SetCodeEvents.
+
+    The Codex runner delivers its generated source only inside the final
+    ``CompleteEvent.result.text_files``, but the frontend receives source via
+    ``setCode`` messages. This wrapper emits one ``SetCodeEvent`` per file in
+    deterministic (sorted) path order immediately before the terminal event,
+    so the adapter's ``variantComplete`` lands after every ``setCode``. A file
+    already emitted as an explicit ``SetCodeEvent`` is never emitted twice.
+    """
+    emitted_files: set[str] = set()
+    async for event in events:
+        if isinstance(event, SetCodeEvent):
+            emitted_files.add(event.file_name)
+            yield event
+        elif isinstance(event, CompleteEvent) and event.result is not None:
+            for path in sorted(event.result.text_files):
+                if path not in emitted_files:
+                    yield SetCodeEvent(
+                        file_name=path, code=event.result.text_files[path]
+                    )
+            yield event
+        else:
+            yield event
+
+
 # Pipeline Middleware Implementations
 
 
@@ -766,9 +978,20 @@ class StatusBroadcastMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
+        # A configured local runner announces exactly one variant (v0.1 local
+        # dispatch streams only variant 0). Unsupported local requests fail
+        # closed downstream with a variantError under the same single-variant
+        # contract. The legacy multi-variant announcement is untouched when no
+        # local runner is selected.
+        assert context.extracted_params is not None
+        if _local_dispatch_decision(context.extracted_params).runner is not None:
+            await context.send_message("variantCount", "1", 0)
+            await context.send_message("status", "Generating code...", 0)
+            await next_func()
+            return
+
         # Determine variant count based on input mode and generation type.
         # Edit/update flows use two variants to keep latency and cost down.
-        assert context.extracted_params is not None
         is_video_mode = context.extracted_params.input_mode == "video"
         is_update = context.extracted_params.generation_type == "update"
         num_variants = (
@@ -790,8 +1013,17 @@ class PromptCreationMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
-        prompt_creator = PromptCreationStage(context.throw_error)
+        # A configured local runner bypasses legacy prompt construction: the
+        # local path builds its own GenerationInput and never consumes
+        # context.prompt_messages, so assembling the legacy prompt here is
+        # wasted work and can fail closed (closing the socket) before the
+        # local dispatch emits its own client-safe outcome.
         assert context.extracted_params is not None
+        if _local_dispatch_decision(context.extracted_params).runner is not None:
+            await next_func()
+            return
+
+        prompt_creator = PromptCreationStage(context.throw_error)
         context.prompt_messages = await prompt_creator.build_prompt_messages(
             context.extracted_params,
         )
@@ -804,9 +1036,19 @@ class CodeGenerationMiddleware(Middleware):
     async def process(
         self, context: PipelineContext, next_func: Callable[[], Awaitable[None]]
     ) -> None:
-        try:
-            assert context.extracted_params is not None
+        assert context.extracted_params is not None
 
+        # Configured local runner: the request is handled entirely by the
+        # local path, before any legacy model selection. Ineligible or
+        # unavailable requests fail closed with a client-safe variantError and
+        # never fall back to the cloud; the local path never reads API keys,
+        # builds an Agent, or calls the next middleware.
+        local_decision = _local_dispatch_decision(context.extracted_params)
+        if local_decision.runner is not None:
+            await self._process_local_generation(context, local_decision)
+            return
+
+        try:
             # Select models (handles video mode internally)
             model_selector = ModelSelectionStage(context.throw_error)
             context.variant_models = await model_selector.select_models(
@@ -868,6 +1110,49 @@ class CodeGenerationMiddleware(Middleware):
             return  # Don't continue the pipeline
 
         await next_func()
+
+    async def _process_local_generation(
+        self,
+        context: PipelineContext,
+        decision: LocalDispatchDecision,
+    ) -> None:
+        """Run an eligible local generation for variant 0, or fail closed.
+
+        The runner is probed at most once per instance (cached); an
+        unsupported or unavailable request emits exactly one client-safe
+        ``variantError`` and returns without generating, without cloud
+        fallback, and without postprocessing. Unexpected transport errors from
+        the sender are deliberately not caught here, so they propagate instead
+        of being masked.
+        """
+        assert context.extracted_params is not None
+        assert decision.runner is not None
+        runner = decision.runner
+
+        if not decision.eligible:
+            await context.send_message("variantError", _LOCAL_UNSUPPORTED_MESSAGE, 0)
+            return
+
+        try:
+            generation_input = _build_generation_input(
+                context.extracted_params, f"req_{uuid.uuid4().hex}"
+            )
+        except Exception:
+            await context.send_message("variantError", _LOCAL_UNSUPPORTED_MESSAGE, 0)
+            return
+
+        probe = await _probe_runner_once(runner)
+        if not probe.available:
+            await context.send_message(
+                "variantError", _safe_unavailable_reason(probe.unavailable_reason), 0
+            )
+            return
+
+        events = _expand_complete_text_files(runner.generate(generation_input))
+        adapter = LocalRunnerWebSocketAdapter(
+            send_message=context.send_message, variant_index=0
+        )
+        await adapter.stream(events)
 
 
 class PostProcessingMiddleware(Middleware):
