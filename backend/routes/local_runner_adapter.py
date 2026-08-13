@@ -40,9 +40,15 @@ AdapterMessageType = Literal[
 
 SendMessage = Callable[[AdapterMessageType, str | None, int], Awaitable[None]]
 
-# Safe, user-facing message for a stream that ended without a terminal event.
-# Must not include provider names, models, artifact paths, or process details.
+# Safe, user-facing message for a stream that ended without a terminal event
+# (clean exhaustion *or* the events iterator raising). Must not include provider
+# names, models, artifact paths, or process details.
 _GENERIC_TERMINATION_ERROR = "Local runner stream ended unexpectedly."
+
+# Safe, user-facing message emitted for every ErrorEvent. The runner's raw error
+# message is never surfaced, logged, or retained at this boundary: it may carry
+# provider names, model identifiers, artifact paths, or credential material.
+_GENERIC_ERROR_EVENT_MESSAGE = "The local runner reported an error."
 
 
 class LocalRunnerWebSocketAdapter:
@@ -51,8 +57,9 @@ class LocalRunnerWebSocketAdapter:
     A well-formed stream ends with exactly one ``CompleteEvent`` or
     ``ErrorEvent``; the adapter emits the matching terminal message exactly once
     and then returns, ignoring any events that follow. A stream that exhausts
-    without a terminal event fails closed with a single generic
-    ``variantError``.
+    without a terminal event — or whose iterator raises before one — fails
+    closed with a single generic ``variantError`` and never propagates the
+    exception.
     """
 
     def __init__(self, send_message: SendMessage, variant_index: int) -> None:
@@ -60,7 +67,21 @@ class LocalRunnerWebSocketAdapter:
         self._variant_index = variant_index
 
     async def stream(self, events: AsyncIterator[GenerationEvent]) -> None:
-        async for event in events:
+        iterator = events.__aiter__()
+        while True:
+            try:
+                event = await iterator.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception:
+                # The events iterator raised before a terminal event. Fail
+                # closed with exactly one generic error and return normally:
+                # the exception is not propagated, logged, or surfaced, because
+                # it may carry provider/model/path/credential detail.
+                await self._send_message(
+                    "variantError", _GENERIC_TERMINATION_ERROR, self._variant_index
+                )
+                return
             if isinstance(event, StatusEvent):
                 await self._send_message(
                     "status", event.message, self._variant_index
@@ -80,7 +101,7 @@ class LocalRunnerWebSocketAdapter:
                 return
             elif isinstance(event, ErrorEvent):
                 await self._send_message(
-                    "variantError", event.message, self._variant_index
+                    "variantError", _GENERIC_ERROR_EVENT_MESSAGE, self._variant_index
                 )
                 return
         # Non-terminal exhaustion: fail closed with exactly one generic error.

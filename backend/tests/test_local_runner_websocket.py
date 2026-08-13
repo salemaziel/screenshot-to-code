@@ -181,10 +181,13 @@ async def test_adapter_emits_variant_error_on_error_event() -> None:
 
     payloads = [call.args[0] for call in websocket.send_json.await_args_list]
 
-    # Status forwarded, then exactly one variantError carrying the event message.
+    # Status forwarded, then exactly one variantError carrying a fixed, generic
+    # client-safe error (never the raw ErrorEvent message).
     assert [p["type"] for p in payloads] == ["status", "variantError"]
     assert all(p["variantIndex"] == 2 for p in payloads)
-    assert payloads[1]["value"] == "Local runner failed to start"
+    assert isinstance(payloads[1]["value"], str)
+    assert payloads[1]["value"].strip() != ""
+    assert payloads[1]["value"] != "Local runner failed to start"
     assert sum(1 for p in payloads if p["type"] == "variantComplete") == 0
 
 
@@ -275,3 +278,91 @@ async def test_adapter_ignores_events_after_terminal_event() -> None:
     # Only messages up to and including the terminal variantComplete are sent.
     assert [p["type"] for p in payloads] == ["status", "variantComplete"]
     assert sum(1 for p in payloads if p["type"] == "variantComplete") == 1
+
+
+@pytest.mark.asyncio
+async def test_error_event_never_leaks_runner_details_to_client() -> None:
+    """Raw ErrorEvent details (provider/model/path/credential) never reach the client.
+
+    The adapter must replace the runner's error message with a fixed, generic,
+    client-safe error regardless of how much sensitive detail the message carries.
+    """
+    hostile_message = (
+        "codex subprocess failed in /tmp/job with model gpt-5 "
+        "using token secret-token"
+    )
+    events: List[GenerationEvent] = [
+        StatusEvent(message="Starting..."),
+        ErrorEvent(message=hostile_message),
+    ]
+    runner = FakeRunner(events)
+
+    websocket = MagicMock()
+    websocket.send_json = AsyncMock()
+    communicator = WebSocketCommunicator(cast(Any, websocket))
+
+    adapter = LocalRunnerWebSocketAdapter(
+        send_message=communicator.send_message,
+        variant_index=0,
+    )
+
+    await adapter.stream(
+        runner.generate(
+            GenerationInput(
+                request_id="req-leak",
+                prompt="Build a page",
+                stack="html_tailwind",
+                generation_type="create",
+            )
+        )
+    )
+
+    payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+
+    assert [p["type"] for p in payloads] == ["status", "variantError"]
+    error_value = payloads[-1]["value"]
+    assert isinstance(error_value, str)
+    assert error_value.strip() != ""
+    # The generic error must not contain any of the raw sensitive tokens.
+    for token in ("/tmp/job", "codex", "gpt-5", "secret-token", hostile_message):
+        assert token not in error_value
+    assert sum(1 for p in payloads if p["type"] == "variantComplete") == 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_fails_closed_when_iterator_raises() -> None:
+    """An iterator that raises before a terminal event fails closed.
+
+    ``stream()`` must emit exactly one generic ``variantError`` and return
+    normally, never propagating the exception and never emitting ``variantComplete``.
+    """
+
+    async def raising_events() -> AsyncIterator[GenerationEvent]:
+        yield StatusEvent(message="Starting...")
+        raise RuntimeError("codex crashed in /tmp/job")
+
+    websocket = MagicMock()
+    websocket.send_json = AsyncMock()
+    communicator = WebSocketCommunicator(cast(Any, websocket))
+
+    adapter = LocalRunnerWebSocketAdapter(
+        send_message=communicator.send_message,
+        variant_index=1,
+    )
+
+    # Must not raise; the exception is contained and reported generically.
+    await adapter.stream(raising_events())
+
+    payloads = [call.args[0] for call in websocket.send_json.await_args_list]
+
+    assert [p["type"] for p in payloads] == ["status", "variantError"]
+    assert all(p["variantIndex"] == 1 for p in payloads)
+    assert sum(1 for p in payloads if p["type"] == "variantError") == 1
+    assert sum(1 for p in payloads if p["type"] == "variantComplete") == 0
+
+    error_value = payloads[-1]["value"]
+    assert isinstance(error_value, str)
+    assert error_value.strip() != ""
+    # The generic error must not leak the exception's sensitive detail.
+    for token in ("codex", "/tmp/job", "RuntimeError"):
+        assert token not in error_value
